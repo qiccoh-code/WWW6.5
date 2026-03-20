@@ -1,8 +1,8 @@
 
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
-
-import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+// import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
 //  Chainlink 的标准预言机接口——用于获取价格信息或在我们的例子中模拟降雨等数据
 import "@openzeppelin/contracts/access/Ownable.sol";
