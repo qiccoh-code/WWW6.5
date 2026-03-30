@@ -1,143 +1,345 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";//供了所有标准代币功能
-import "@openzeppelin/contracts/access/Ownable.sol";//只由合约所有者更改
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";//保护函数免受攻击
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";//SafeERC20 是处理其他 ERC-20 代币的安全网
-import "@openzeppelin/contracts/access/AccessControl.sol";//允许合约定义自定义角色
-import "@openzeppelin/contracts/interfaces/IERC20Metadata.sol";//取关于抵押代币的额外信息
-import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";//看到抵押代币的真实世界价格
+// 导入 OpenZeppelin 合约
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 
+// ==================== Mock Chainlink 预言机 ====================
 
-/**
-- **ERC20**——这为我们的稳定币提供了所有基本的代币行为，如转账代币、批准支出者和检查余额。
-- **Ownable**——添加一个简单的所有权模型，所以我们可以控制谁有权执行敏感操作，如更新系统设置。
-- **ReentrancyGuard**——保护关键函数免受重入攻击，使铸造和赎回等操作更加安全。
-- **AccessControl**——允许我们定义自定义角色（如价格源管理器），并精细控制谁可以调用某些函数。
-**/
-
-contract SimpleStablecoin is ERC20, Ownable, ReentrancyGuard, AccessControl {
+/// @title Mock Chainlink 价格预言机
+/// @dev 模拟 Chainlink AggregatorV3Interface
+/// @dev 用于本地测试，管理员可以手动设置价格
+contract MockPriceFeed {
+    /// @notice 价格数据结构
+    struct RoundData {
+        uint80 roundId;         // 轮次 ID
+        int256 answer;          // 价格答案
+        uint256 startedAt;      // 开始时间
+        uint256 updatedAt;      // 更新时间
+        uint80 answeredInRound; // 回答的轮次
+    }
     
-    using SafeERC20 for IERC20;//我们与之交互的所有 IERC20 代币激活 SafeERC20
-
-    bytes32 public constant PRICE_FEED_MANAGER_ROLE = keccak256("PRICE_FEED_MANAGER_ROLE");//它控制谁可以更新价格源
-    IERC20 public immutable collateralToken;//用户必须作为抵押品存入的 ERC-20 代币的地址
-    uint8 public immutable collateralDecimals;//不同的 ERC-20 代币可以有不同数量的小数
-    AggregatorV3Interface public priceFeed;// Chainlink 价格源 合约
-    uint256 public collateralizationRatio = 150; // 以百分比表示（150 = 150%）
-//铸造新稳定币时，就会触发此事件
-    event Minted(address indexed user, uint256 amount, uint256 collateralDeposited);
-    // 将稳定币赎回为抵押品时
-    event Redeemed(address indexed user, uint256 amount, uint256 collateralReturned);
-    // 价格源地址已更新
-    event PriceFeedUpdated(address newPriceFeed);
-    // 抵押率被更改
-    event CollateralizationRatioUpdated(uint256 newRatio);
-// 自定义错误
-    error InvalidCollateralTokenAddress();//如果有人试图用无效（零）抵押代币地址部署合约，就会抛出此错误
-    error InvalidPriceFeedAddress();//提供的价格源地址无效
-    error MintAmountIsZero();//用户试图铸造零稳定币
-    error InsufficientStablecoinBalance();//用户试图赎回比他们实际余额更多的稳定币
-    error CollateralizationRatioTooLow();//试图将抵押率设置为低于 100%
-
-    constructor(
-        /**
-        - **抵押代币**的地址（像 USDC、WETH 等 ERC-20）
-        - **初始所有者**的地址（管理员）
-        - **Chainlink 价格源**的地址（获取实时抵押品价格
-        **/
-        address _collateralToken,
-        address _initialOwner,
-        address _priceFeed
-    ) ERC20("Simple USD Stablecoin", "sUSD") Ownable(_initialOwner) {
-        // 调用 OpenZeppelin 的 ERC-20 构造函数——
-        // 给我们的代币一个**名称**（"Simple USD Stablecoin"）和一个**符号**（"sUSD"）
-        if (_collateralToken == address(0)) revert InvalidCollateralTokenAddress();
-        if (_priceFeed == address(0)) revert InvalidPriceFeedAddress();
-
-        collateralToken = IERC20(_collateralToken);//保存抵押代币的地址
-        collateralDecimals = IERC20Metadata(_collateralToken).decimals();//获取并存储抵押代币的小数
-        priceFeed = AggregatorV3Interface(_priceFeed);
-
-        _grantRole(DEFAULT_ADMIN_ROLE, _initialOwner);
-        _grantRole(PRICE_FEED_MANAGER_ROLE, _initialOwner);
-/**
-- **DEFAULT_ADMIN_ROLE**——让所有者完全控制合约的角色系统
-- **PRICE_FEED_MANAGER_ROLE**——让所有者在将来需要时更新价格源
-**/
-
+    /// @notice 当前价格数据
+    /// @dev 使用 _data 后缀避免与函数名冲突
+    RoundData public latestRoundDataStored;
+    
+    /// @notice 价格小数位数（Chainlink 标准是 8 位）
+    uint8 public decimals = 8;
+    
+    /// @notice 预言机管理员
+    address public admin;
+    
+    /// @notice 构造函数，设置初始价格
+    /// @param _initialPrice 初始价格（8 位小数）
+    constructor(int256 _initialPrice) {
+        admin = msg.sender;
+        updatePrice(_initialPrice);
     }
-// 公共视图函数——任何人都可以调用它来获取最新价格，并且它不会改变任何状态
-    function getCurrentPrice() public view returns (uint256) {
-        (, int256 price, , , ) = priceFeed.latestRoundData();
-        require(price > 0, "Invalid price feed response");
-        return uint256(price);
+    
+    /// @notice 更新价格（仅管理员）
+    /// @param _price 新价格（8 位小数）
+    function updatePrice(int256 _price) public {
+        require(msg.sender == admin, "Only admin");
+        latestRoundDataStored = RoundData({
+            roundId: latestRoundDataStored.roundId + 1,
+            answer: _price,
+            startedAt: block.timestamp,
+            updatedAt: block.timestamp,
+            answeredInRound: latestRoundDataStored.roundId + 1
+        });
     }
-
-// 铸造稳定币
-    function mint(uint256 amount) external nonReentrant {
-        if (amount == 0) revert MintAmountIsZero();
-
-        uint256 collateralPrice = getCurrentPrice();
-        uint256 requiredCollateralValueUSD = amount * (10 ** decimals()); // 假设 sUSD 为 18 位小数
-        uint256 requiredCollateral = (requiredCollateralValueUSD * collateralizationRatio) / (100 * collateralPrice);
-        uint256 adjustedRequiredCollateral = (requiredCollateral * (10 ** collateralDecimals)) / (10 ** priceFeed.decimals());
-
-        collateralToken.safeTransferFrom(msg.sender, address(this), adjustedRequiredCollateral);
-        _mint(msg.sender, amount);
-
-        emit Minted(msg.sender, amount, adjustedRequiredCollateral);
+    
+    /// @notice 获取最新价格数据（符合 Chainlink 接口）
+    /// @return roundId 轮次 ID
+    /// @return answer 价格
+    /// @return startedAt 开始时间
+    /// @return updatedAt 更新时间
+    /// @return answeredInRound 回答的轮次
+    function latestRoundData() external view returns (
+        uint80 roundId,
+        int256 answer,
+        uint256 startedAt,
+        uint256 updatedAt,
+        uint80 answeredInRound
+    ) {
+        return (
+            latestRoundDataStored.roundId,
+            latestRoundDataStored.answer,
+            latestRoundDataStored.startedAt,
+            latestRoundDataStored.updatedAt,
+            latestRoundDataStored.answeredInRound
+        );
     }
-// 赎回稳定币
-    function redeem(uint256 amount) external nonReentrant {
-        if (amount == 0) revert MintAmountIsZero();
-        if (balanceOf(msg.sender) < amount) revert InsufficientStablecoinBalance();
-
-        uint256 collateralPrice = getCurrentPrice();
-        uint256 stablecoinValueUSD = amount * (10 ** decimals());
-        uint256 collateralToReturn = (stablecoinValueUSD * 100) / (collateralizationRatio * collateralPrice);
-        uint256 adjustedCollateralToReturn = (collateralToReturn * (10 ** collateralDecimals)) / (10 ** priceFeed.decimals());
-
-        _burn(msg.sender, amount);
-        collateralToken.safeTransfer(msg.sender, adjustedCollateralToReturn);
-
-        emit Redeemed(msg.sender, amount, adjustedCollateralToReturn);
-    }
-// 更新抵押率
-    function setCollateralizationRatio(uint256 newRatio) external onlyOwner {
-        if (newRatio < 100) revert CollateralizationRatioTooLow();
-        collateralizationRatio = newRatio;
-        emit CollateralizationRatioUpdated(newRatio);
-    }
-
-    function setPriceFeedContract(address _newPriceFeed) external onlyRole(PRICE_FEED_MANAGER_ROLE) {
-        if (_newPriceFeed == address(0)) revert InvalidPriceFeedAddress();
-        priceFeed = AggregatorV3Interface(_newPriceFeed);
-        emit PriceFeedUpdated(_newPriceFeed);
-    }
-//预览所需抵押品
-    function getRequiredCollateralForMint(uint256 amount) public view returns (uint256) {
-        if (amount == 0) return 0;
-
-        uint256 collateralPrice = getCurrentPrice();
-        uint256 requiredCollateralValueUSD = amount * (10 ** decimals());
-        uint256 requiredCollateral = (requiredCollateralValueUSD * collateralizationRatio) / (100 * collateralPrice);
-        uint256 adjustedRequiredCollateral = (requiredCollateral * (10 ** collateralDecimals)) / (10 ** priceFeed.decimals());
-
-        return adjustedRequiredCollateral;
-    }
-//预览赎回时返回的抵押品
-    function getCollateralForRedeem(uint256 amount) public view returns (uint256) {
-        if (amount == 0) return 0;
-
-        uint256 collateralPrice = getCurrentPrice();
-        uint256 stablecoinValueUSD = amount * (10 ** decimals());
-        uint256 collateralToReturn = (stablecoinValueUSD * 100) / (collateralizationRatio * collateralPrice);
-        uint256 adjustedCollateralToReturn = (collateralToReturn * (10 ** collateralDecimals)) / (10 ** priceFeed.decimals());
-
-        return adjustedCollateralToReturn;
-    }
-
 }
 
+/// @title Chainlink 聚合器接口
+/// @dev 标准 Chainlink 价格预言机接口
+/// @dev 用于与真实 Chainlink 预言机交互
+interface AggregatorV3Interface {
+    function decimals() external view returns (uint8);
+    function latestRoundData() external view returns (
+        uint80 roundId,
+        int256 answer,
+        uint256 startedAt,
+        uint256 updatedAt,
+        uint80 answeredInRound
+    );
+}
+
+// ==================== 稳定币合约 ====================
+
+/// @title 简单稳定币合约
+/// @title Simple Stablecoin
+/// @dev 一个超额抵押的稳定币系统，以 ETH 作为抵押品
+/// @dev 抵押率要求 150%，即每铸造 1 美元稳定币需要 1.5 美元 ETH 抵押
+/// @dev 继承 ERC20（稳定币本身）、ReentrancyGuard（防重入）、Ownable（管理权限）
+contract SimpleStablecoin is ERC20, ReentrancyGuard, Ownable {
+    
+    // ==================== 状态变量 ====================
+    
+    /// @notice ETH/USD 价格预言机
+    /// @dev 使用 Chainlink 预言机获取 ETH 实时价格
+    AggregatorV3Interface internal priceFeed;
+
+    /// @notice 抵押率要求（百分比）
+    /// @dev 150 表示 150% 抵押率
+    /// @dev 这意味着每铸造 100 美元的稳定币，需要 150 美元的 ETH 抵押
+    uint256 public constant COLLATERAL_RATIO = 150;
+    
+    /// @notice 清算奖励比例
+    /// @dev 5 表示 5% 的奖励给清算人
+    uint256 public constant LIQUIDATION_BONUS = 5;
+
+    /// @notice 用户抵押品映射
+    /// @dev 用户地址 => 抵押的 ETH 数量（wei）
+    mapping(address => uint256) public collateralDeposited;
+
+    // ==================== 事件 ====================
+    
+    /// @notice 存入抵押品事件
+    /// @param user 用户地址
+    /// @param amount 存入的 ETH 数量
+    event CollateralDeposited(address indexed user, uint256 amount);
+    
+    /// @notice 铸造稳定币事件
+    /// @param user 用户地址
+    /// @param amount 铸造的稳定币数量
+    event StablecoinMinted(address indexed user, uint256 amount);
+    
+    /// @notice 销毁稳定币事件
+    /// @param user 用户地址
+    /// @param amount 销毁的稳定币数量
+    event StablecoinBurned(address indexed user, uint256 amount);
+    
+    /// @notice 提取抵押品事件
+    /// @param user 用户地址
+    /// @param amount 提取的 ETH 数量
+    event CollateralWithdrawn(address indexed user, uint256 amount);
+    
+    /// @notice 清算事件
+    /// @param liquidator 清算人地址
+    /// @param user 被清算的用户地址
+    /// @param debtPaid 偿还的债务金额
+    /// @param collateralSeized 获得的抵押品数量
+    event Liquidation(
+        address indexed liquidator,
+        address indexed user,
+        uint256 debtPaid,
+        uint256 collateralSeized
+    );
+
+    // ==================== 构造函数 ====================
+    
+    /// @notice 创建稳定币合约
+    /// @param _priceFeedAddress 价格预言机地址
+    /// @dev 初始化 ERC20 代币，名称为 "StableUSD"，符号为 "SUSD"
+    constructor(address _priceFeedAddress) 
+        ERC20("StableUSD", "SUSD") 
+        Ownable(msg.sender) 
+    {
+        priceFeed = AggregatorV3Interface(_priceFeedAddress);
+    }
+
+    // ==================== 核心功能 ====================
+    
+    /// @notice 存入 ETH 作为抵押品
+    /// @dev 用户发送 ETH 到合约，增加其抵押品余额
+    function depositCollateral() external payable {
+        // 检查存入金额大于 0
+        require(msg.value > 0, "Must deposit some ETH");
+        
+        // 增加用户的抵押品记录
+        collateralDeposited[msg.sender] += msg.value;
+        
+        // 触发存入事件
+        emit CollateralDeposited(msg.sender, msg.value);
+    }
+
+    /// @notice 铸造稳定币
+    /// @param amountToMint 要铸造的稳定币数量
+    /// @dev 用户必须有足够的抵押品才能铸造
+    /// @dev 使用 nonReentrant 防止重入攻击
+    function mintStablecoin(uint256 amountToMint) external nonReentrant {
+        // 计算用户当前抵押品的美元价值
+        uint256 currentEthValue = getCollateralValueInUsd(msg.sender);
+        
+        // 获取用户当前的债务（已铸造的稳定币）
+        uint256 currentDebt = balanceOf(msg.sender);
+        
+        // 计算最大可铸造金额
+        // 公式：最大可铸造 = 抵押品价值 * 100 / 抵押率
+        // 例如：$150 抵押品，150% 抵押率，最大可铸造 = 150 * 100 / 150 = $100
+        uint256 maxMintable = (currentEthValue * 100) / COLLATERAL_RATIO;
+        
+        // 检查铸造后不会超过最大可铸造金额
+        require(currentDebt + amountToMint <= maxMintable, "Not enough collateral!");
+
+        // 铸造稳定币给用户
+        _mint(msg.sender, amountToMint);
+        
+        // 触发铸造事件
+        emit StablecoinMinted(msg.sender, amountToMint);
+    }
+
+    /// @notice 销毁稳定币
+    /// @param amountToBurn 要销毁的稳定币数量
+    /// @dev 用户销毁自己的稳定币，减少债务
+    function burnStablecoin(uint256 amountToBurn) external nonReentrant {
+        // 销毁用户的稳定币
+        _burn(msg.sender, amountToBurn);
+        
+        // 触发销毁事件
+        emit StablecoinBurned(msg.sender, amountToBurn);
+    }
+
+    /// @notice 提取抵押品
+    /// @param amount 要提取的 ETH 数量
+    /// @dev 提取后必须保持足够的抵押率
+    function withdrawCollateral(uint256 amount) external nonReentrant {
+        // 获取用户当前债务
+        uint256 currentDebt = balanceOf(msg.sender);
+        
+        // 计算提取后的剩余抵押品
+        uint256 remainingCollateral = collateralDeposited[msg.sender] - amount;
+        
+        // 计算剩余抵押品的美元价值
+        uint256 remainingValue = (remainingCollateral * getEthPrice()) / 1e18;
+        
+        // 计算所需的最低抵押品价值
+        // 公式：所需价值 = 债务 * 抵押率 / 100
+        uint256 requiredCollateralValue = (currentDebt * COLLATERAL_RATIO) / 100;
+
+        // 检查提取后仍有足够的抵押品
+        require(remainingValue >= requiredCollateralValue, "Cannot withdraw, health factor too low");
+
+        // 减少用户的抵押品记录
+        collateralDeposited[msg.sender] -= amount;
+        
+        // 将 ETH 转给用户
+        // 使用 call 替代已弃用的 transfer
+        (bool sent, ) = payable(msg.sender).call{value: amount}("");
+        require(sent, "ETH transfer failed");
+        
+        // 触发提取事件
+        emit CollateralWithdrawn(msg.sender, amount);
+    }
+
+    // ==================== 清算功能 ====================
+    
+    /// @notice 清算不健康的头寸
+    /// @param user 要清算的用户地址
+    /// @dev 当用户的抵押率低于 150% 时，任何人都可以清算
+    /// @dev 清算人支付债务，获得抵押品 + 奖励
+    function liquidate(address user) external nonReentrant {
+        // 获取用户的抵押品价值
+        uint256 collateralValue = getCollateralValueInUsd(user);
+        
+        // 获取用户的债务
+        uint256 debtValue = balanceOf(user);
+        
+        // 如果没有债务，直接返回
+        if (debtValue == 0) return;
+
+        // 计算健康因子（抵押率）
+        // 公式：健康因子 = 抵押品价值 * 100 / 债务
+        uint256 healthFactor = (collateralValue * 100) / debtValue;
+        
+        // 检查头寸不健康（低于 150% 抵押率）
+        require(healthFactor < COLLATERAL_RATIO, "Position is healthy");
+        
+        // 清算人销毁稳定币来偿还用户的债务
+        _burn(msg.sender, debtValue);
+        
+        // 获取用户的全部抵押品
+        uint256 collateralToTransfer = collateralDeposited[user];
+        
+        // 清空用户的抵押品记录
+        collateralDeposited[user] = 0;
+        
+        // 将抵押品 + 奖励转给清算人
+        // 清算人获得用户的全部抵押品 + 5% 奖励
+        // 计算公式：抵押品 + (抵押品 * 5 / 100) = 抵押品 * 105 / 100
+        (bool sent, ) = payable(msg.sender).call{value: collateralToTransfer * (100 + LIQUIDATION_BONUS) / 100}("");
+        require(sent, "Collateral transfer failed");
+        
+        // 触发清算事件
+        emit Liquidation(msg.sender, user, debtValue, collateralToTransfer);
+    }
+
+    // ==================== 价格预言机功能 ====================
+    
+    /// @notice 获取 ETH 当前价格
+    /// @return ETH 价格（18 位小数）
+    /// @dev 从 Chainlink 预言机获取价格，并转换为 18 位小数
+    function getEthPrice() public view returns (uint256) {
+        // 从预言机获取最新价格数据
+        (, int256 price, , , ) = priceFeed.latestRoundData();
+        
+        // 如果价格为负数，返回 0
+        if (price < 0) return 0;
+        
+        // Chainlink 返回的价格是 8 位小数
+        // 我们需要转换为 18 位小数，所以乘以 1e10
+        // 例如：Chainlink 返回 2000_00000000（$2000，8位小数）
+        // 转换后：2000_00000000 * 1e10 = 2000_000000000000000000（18位小数）
+        return uint256(price) * 1e10;
+    }
+
+    /// @notice 获取用户抵押品的美元价值
+    /// @param user 用户地址
+    /// @return 抵押品价值（美元，18 位小数）
+    function getCollateralValueInUsd(address user) public view returns (uint256) {
+        // 获取用户的 ETH 抵押数量
+        uint256 ethAmount = collateralDeposited[user];
+        
+        // 获取 ETH 当前价格
+        uint256 ethPrice = getEthPrice();
+        
+        // 计算美元价值
+        // 公式：(ETH 数量 * ETH 价格) / 1e18
+        // 需要除以 1e18 是因为 ethPrice 是 18 位小数
+        return (ethAmount * ethPrice) / 1e18;
+    }
+    
+    /// @notice 获取用户的健康因子
+    /// @param user 用户地址
+    /// @return 健康因子（百分比）
+    function getHealthFactor(address user) external view returns (uint256) {
+        uint256 collateralValue = getCollateralValueInUsd(user);
+        uint256 debtValue = balanceOf(user);
+        
+        if (debtValue == 0) return type(uint256).max; // 无债务时返回最大值
+        
+        return (collateralValue * 100) / debtValue;
+    }
+    
+    /// @notice 获取最大可铸造金额
+    /// @param user 用户地址
+    /// @return 最大可铸造的稳定币数量
+    function getMaxMintable(address user) external view returns (uint256) {
+        uint256 collateralValue = getCollateralValueInUsd(user);
+        return (collateralValue * 100) / COLLATERAL_RATIO;
+    }
+}
